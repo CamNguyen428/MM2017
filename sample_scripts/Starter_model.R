@@ -87,9 +87,11 @@ generateFeatures <- function(season = fread("RegularSeasonDetailedResults.csv"))
     getAdjustedPointDiff <- function() {
         source("timepointdiff.R")
         tidySeason <- getTidySeason()
-        tidySeason[, id := paste(Season, Team, sep = "_")][, Ascore := mean(Ascore), by = id]
-        
-        tidySeason <- tidySeason[, .(team_id = id, Ascore)] %>% unique
+        tidySeason[, team_id := paste(Season, Team, sep = "_")][
+            , alpha := fitSES(Ascore), by = team_id][
+                , Ascore := mean(Ascore), by = team_id]
+        tidySeason[, c("Season", "Team", "Daynum") := NULL]
+        tidySeason <- tidySeason %>% unique
     }
     ret <- getPointDiffs() %>% merge(getAdjustedPointDiff(), by = "team_id")
 }
@@ -108,10 +110,12 @@ addFeatures <- function(dt, history = fread("RegularSeasonDetailedResults.csv"))
         seeds <- fread("TourneySeeds.csv")
         seeds[, id:= paste(Season, Team, sep = "_")]
         seeds[, SeedNum := gsub('[a-zA-Z]', '', Seed) %>% as.numeric]
-        temp <- merge(dt, seeds[, .(id, SeedNum)], by.x = "team1", by.y = "id")
-        temp <- merge(temp, seeds[, .(id, SeedNum)], by.x = "team2", by.y = "id", suffixes = c(".1", ".2"))
+        temp <- merge(dt, seeds[, .(id, SeedNum)], by.x = "team1", by.y = "id", all.x = T)
+        temp <- merge(temp, seeds[, .(id, SeedNum)], by.x = "team2", by.y = "id", suffixes = c(".1", ".2"), all.x = T)
         dt[, Seed.1 := temp$SeedNum.1]
         dt[, Seed.2 := temp$SeedNum.2]
+        #dt[, hasSeed.1 := !is.na(Seed.1)]
+        #dt[, hasSeed.2 := !is.na(Seed.2)]
     }
     addAggressiveness <- function(dt, history = history) {
         temp <- calcFeat(history, Wfta^2 + Wor^2 + Wto^2 + Wpf^2, "Aggressiveness")
@@ -138,7 +142,7 @@ addFeatures <- function(dt, history = fread("RegularSeasonDetailedResults.csv"))
         }
     }
     createFreeThrowPercentage(dt)
-    #addSeeds(dt)
+    addSeeds(dt)
     #addAggressiveness(dt)
     addGeneratedFeatures(dt)
 }
@@ -187,22 +191,24 @@ addFeatures(training)
 
 ##### Build and Evaluate the Model #####
 m1 <- buildModel(training)
-#m2 <- buildModel(training, method = "xgbLinear") # Log loss increases on submission data
+m2 <- buildModel(training, method = "glmnet") # Log loss increases on submission data
 
 evalModel(m1)
-#evalModel(m2)
+evalModel(m2)
 
 submission <- fread("sample_submission.csv") %>% getStats()
 addFeatures(submission)
 labels <- fread("TourneyDetailedResults.csv") %>% convertTrn()
 submission <- merge(submission, labels, by = "id")
-evalModel(m1, submission)
+evalModel(m2, submission)
 
-# Log Loss: .6436
-# Accuracy: .7015
+# Log Loss: .6436, with alpha: .5944
+# Accuracy: .7015, with alpha: .6642
 
 # Compare to benchmark
 library(MLmetrics)
 bm <- fread("SeedLinearModelSubmission.csv") %>% merge(labels, by = "id")
 paste("Benchmark Logloss:", LogLoss(bm$pred, bm$label))
 paste("My Logloss:", LogLoss(evalModel(m1, submission, labeled = F), submission$label))
+paste("My Logloss2:", LogLoss(evalModel(m2, submission, labeled = F), submission$label))
+#.5856

@@ -61,6 +61,14 @@ getTidySeason <- function() {
     tidySeason
 }
 
-tidySeason <- getTidySeason()
-ggplot(tidySeason[Season > 2008][Team == 1242]) + geom_line(aes(x = Daynum, y = Ascore)) + facet_wrap(~ Season)
+#tidySeason <- getTidySeason()
+#ggplot(tidySeason[Season > 2008][Team == 1242]) + geom_line(aes(x = Daynum, y = Ascore)) + facet_wrap(~ Season)
+
+fitSES <- function(games) {
+    hw <- games %>% ts %>% HoltWinters(beta = F, gamma = F)
+    hw$coefficients[1]
+}
+
+#hws <- tidySeason %>% arrange(Season, Team, Daynum) %>% group_by(Season, Team) %>% 
+#    summarise(alpha = fitSES(Ascore))
 

@@ -1,0 +1,64 @@
+---
+title: "March Madness 2017"
+output: html_notebook
+---
+
+This notebook uses historical March Madness data to predict the results of the 2017 tournament.
+
+## Reading the data
+The data comes in the following files:
+```{bash}
+ls | grep csv$
+```
+When training the model, we mostly care about using the detailed results to develop features. The detailed data, both tournament and regular season, contains game by game information as follows:
+```{r Setup}
+# Setup
+library(data.table)
+library(tidyverse)
+```
+
+```{r Read Data}
+regularSeason <- fread("RegularSeasonDetailedResults.csv")
+tournament <- fread("TourneyDetailedResults.csv")
+head(regularSeason)
+```
+## Tidying the data
+To generate training and testing data, we need to work with data tables with the same formatting as the sample submission, which is formatted as follows:
+```{r}
+sampleSub <- fread("sample_submission.csv")
+head(sampleSub)
+```
+We need to get ids for all the games that contain the season, followed by the team with the lower team id, then the team with the higher team id. 
+The label is 1 when the team with the lower team id wins, and 0 otherwise. To create this data table, we use the following function:
+```{r}
+# Converts detailed data to submission data
+convertToSub <- function(dt) {
+    dt <- copy(dt)
+    dt[, id := paste(Season, ifelse(Wteam > Lteam, Lteam, Wteam), ifelse(Wteam < Lteam, Lteam, Wteam), sep = "_")]
+    dt[, label := as.numeric(Wteam < Lteam)]
+    dt[, .(id, label)]
+}
+
+labeledSeason <- convertToSub(regularSeason)
+labeledTournament <- convertToSub(tournament)
+head(labeledSeason)
+head(labeledTournament)
+```
+Now that we have labeled data that we can add features to, we use the historical data to generate features.
+
+## Working with the Historical Data
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
