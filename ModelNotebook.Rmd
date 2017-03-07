@@ -1,36 +1,50 @@
 ---
 title: "March Madness 2017"
-output: html_notebook
+output:
+  html_notebook: default
+  pdf_document: default
 ---
 
 This notebook uses historical March Madness data to predict the results of the 2017 tournament.
 
 ## Reading the data
 The data comes in the following files:
-```{bash}
-ls | grep csv$
-```
+
+* RegularSeasonCompactResults.csv
+* RegularSeasonDetailedResults.csv
+* Seasons.csv
+* Teams.csv
+* TourneyCompactResults.csv
+* TourneyDetailedResults.csv
+* TourneySeeds.csv
+* TourneySlots.csv
+* sample_submission.csv
+
 When training the model, we mostly care about using the detailed results to develop features. The detailed data, both tournament and regular season, contains game by game information as follows:
-```{r Setup}
+```{r Setup, message=FALSE, warning=FALSE, include=FALSE}
 # Setup
 library(data.table)
 library(tidyverse)
+library(caret)
+library(lazyeval)
+set.seed(2)
 ```
 
 ```{r Read Data}
 regularSeason <- fread("RegularSeasonDetailedResults.csv")
 tournament <- fread("TourneyDetailedResults.csv")
 head(regularSeason)
+head(tournament)
 ```
 ## Tidying the data
 To generate training and testing data, we need to work with data tables with the same formatting as the sample submission, which is formatted as follows:
-```{r}
+```{r Show Sub}
 sampleSub <- fread("sample_submission.csv")
 head(sampleSub)
 ```
 We need to get ids for all the games that contain the season, followed by the team with the lower team id, then the team with the higher team id. 
 The label is 1 when the team with the lower team id wins, and 0 otherwise. To create this data table, we use the following function:
-```{r}
+```{r Format to Submission}
 # Converts detailed data to submission data
 convertToSub <- function(dt) {
     dt <- copy(dt)
@@ -47,18 +61,317 @@ head(labeledTournament)
 Now that we have labeled data that we can add features to, we use the historical data to generate features.
 
 ## Working with the Historical Data
+The game-by-game records from the detailed data sets contain a lot of information that we cannot use in its current form.
 
+To create features that can be added to our labeled data, we look at the following approaches:
 
+1. Get season averages from the available statistics
+    + Compute advanced statistics, like an adjusted score for each game based on the opponents allowed points per game, then take the season average again
+2. Create a score for how "hot" a team is using the data as a time series, possibly using the advanced statistics calculated previously
+3. Look at historical head-to-head matchups
 
+### Computing Season Averages
+The following function computes the season averages for each of the major basketball offensive statistical categories using any detailed data.
 
+```{r Compute Season Averages}
+compressStats <- function(dt) {
+    # Helper function to calculate for a single feature
+    calcFeatWithString <- function(dt, featStr) {
+        wFeat <- dt[, .(wfeat = mean(get(featStr)), nwins = .N), by = c("Season", "Wteam")]
+        featStr2 <- gsub("^W", "L", featStr)
+        lFeat <- dt[, .(lfeat = mean(get(featStr2)), nloss = .N), by = c("Season", "Lteam")]
+        feat <- merge(wFeat, lFeat, by.x = c("Season", "Wteam"), by.y = c("Season", "Lteam"), all = T)
+        feat[is.na(feat)] <- 0
+        feat[, ft := (wfeat*nwins +  lfeat*nloss)/ (nwins+nloss)]
+        ret <- feat[, .(Season, Wteam, ft)]
+        names(ret) <- c("Season", "Team", featStr)
+        ret
+    }
+    dt <- copy(dt)
+    dt[, Wloc := NULL]
+    statNames <- grep("^W", names(dt), value = T)
+    statNames <- statNames[statNames != "Wteam"]
+    ret <- dt[, .(Season, Team = Wteam)] %>% unique()
+    for(stat in statNames) {
+        ret <- merge(ret,
+                     calcFeatWithString(dt, stat), by = c("Season", "Team"), all = T)
+    }
+    return(ret)
+}
 
+```
+The output is as follows:
+```{r Season Averages}
+seasonStats <- compressStats(regularSeason)
+str(seasonStats)
+```
+In addition to the team statistics calculated above, there are others that can be calculated.
 
+#### Additional Statistics
+The following function takes in the season statistics calculated above and calculates additional features.
+Note that free throw attempts and makes are removed since they have a strong correlation, 
+which would not be suited for model training. Interaction terms involving possessions are added since
+the pace a team plays at could be a strength for certain teams.
+```{r Additional Statistics}
+addFeatures <- function(df) {
+    createFreeThrowPercentage <- function(df) {
+       df %>% mutate(Wftp = Wftm / Wfta)
+    }
+    addSeeds <- function(df) {
+        seeds <- fread("TourneySeeds.csv")
+        seeds[, SeedNum := gsub('[a-zA-Z]', '', Seed) %>% as.numeric]
+        combined <- merge(df, seeds[, .(Season, Team, SeedNum)], 
+                          all.x = T, by = c("Season", "Team"))
+        combined
+    }
+    addPossessions <- function(df) {
+        df <- df %>% mutate(Poss = Wfga + Wor + Wto + Wfta %/% 2)
+    }
+    addInteractions <- function(df) {
+        # Using average possessions per game could be a measure of pace, which could have interaction
+        features <- paste0("Poss*", grep(pattern = "^W", names(df), value = T))
+        featureForms <- lapply(X = features, interp)
+        df <- df %>% mutate_(.dots = setNames(featureForms, features))
+        df
+    }
+    removeFreeThrows <- function(df) {
+        df %>% select(-Wftm, -Wfta)
+    }
+    computeAssistPercentage <- function(df) {
+        df <- df %>% mutate(WAstPctg = Wast / Wfgm)
+    }
+    computePointsPerPossession <- function(df) {
+        df %>% mutate(PPP = Wscore / Poss)
+    }
+    
+    df <- df %>% createFreeThrowPercentage() %>% addSeeds() %>% 
+        addPossessions() %>% 
+        computeAssistPercentage %>%
+        removeFreeThrows() %>% addInteractions() %>% computePointsPerPossession()
+    invisible(df)
+}
 
+seasonStats2 <- addFeatures(seasonStats) %>% data.table()
+str(seasonStats2)
+```
+Now that we have the labeled data and the stats for each team, we can combine them with this function:
+```{r Combine Label with Stats}
+combineLabelsWithStats <- function(labeled, stats) {
+    stats <- copy(stats)
+    stats[, id := paste(Season, Team, sep = "_")]
+    stats$Season <- stats$Team <- NULL
+    labeled <- copy(labeled)
+    labeled[, team1 := gsub("_[0-9]+$", "", id)]
+    labeled[, team2 := gsub("_[0-9]+_", "_", id)]
+    ret <- merge(labeled, stats, all.x = T, by.x = "team1", by.y ="id")
+    ret <- merge(ret, stats, all.x = T, by.x = "team2", by.y ="id", suffixes = c(".1", ".2"))
+    ret[, team2 := NULL][, team1 := NULL]
+    ret
+}
 
+labeledSeasonStats <- combineLabelsWithStats(labeledSeason, seasonStats2)
+```
 
+When preparing a bracket, we do not have any detailed information about the teams' performances in the tournament. We can combine the regular season details with the tournament teams as such:
 
+```{r Tournament Stats}
+tournamentWithSeasonStats <- combineLabelsWithStats(labeledTournament, seasonStats2)
+head(tournamentWithSeasonStats)
+```
+## Analyzing the Time Series
+We use the following function to compute averages for basketball stats for each team by season
+```{r Calculate Feature Function, eval=FALSE, include=FALSE}
+calcFeat <- function(dt, featCalc, featName = "feat") {
+        # Get arguments
+        arguments <- as.list(match.call())
+        # Calculate number of wins and mean of arg when winning for each team
+        wFeat <- dt[, .(wfeat = mean(eval(arguments$featCalc, dt)), nwins = .N), by = c("Season", "Wteam")]
+        
+        # Change the table so names that start with W start with L and vice versa
+        dtc <- copy(dt)
+        names(dtc) <- gsub("^W", "l", names(dtc))
+        names(dtc) <- gsub("^L", "W", names(dtc))
+        names(dtc) <- gsub("^l", "L", names(dtc))
+        
+        # Calculate number of losses and mean of arg when losing for each team
+        lFeat <- dtc[, .(lfeat = mean(eval(arguments$featCalc, dtc)), nloss = .N), by = c("Season", "Wteam")]
+        
+        # Combine tables for wins and losses
+        feat <- merge(wFeat, lFeat, by = c("Season", "Wteam"), all = T)
+        feat[is.na(feat)] <- 0
+        feat[, ft := (wfeat*nwins +  lfeat*nloss)/ (nwins+nloss)]
+        names(feat) <- c("Season", "Team", paste0("w.", featName), "nwins", paste0("l.", featName), "nloss", featName)
+        feat
+    }
+```
 
+Using the helper function, we compute the points per game and allowed points per game for each team. We add those
+on to the regular season data.
+```{r Compute Average PPG, eval=FALSE, include=FALSE}
+compactSeason <- fread("RegularSeasonCompactResults.csv")
 
+getAveragePointsForGame <- function(season) {
+    # Get ppg and oppg for each team
+    ppg <- calcFeat(season, Wscore, "ppg")[, .(Season, Team, ppg)]
+    oppg <- calcFeat(season, Lscore, "oppg")[, .(Season, Team, oppg)]
+    
+    wppg <- copy(ppg)
+    names(wppg) <- c("Season", "Wteam", "Wppg")
+    seasonWithppg <- merge(season, wppg, by = c("Season", "Wteam"))
+    lppg <- wppg
+    names(lppg) <- c("Season", "Lteam", "Lppg")
+    seasonWithppg <- merge(seasonWithppg, lppg, by = c("Season", "Lteam"))
+    
+    woppg <- copy(oppg)
+    names(woppg) <- c("Season", "Wteam", "Woppg")
+    seasonWithppg <- merge(seasonWithppg, woppg, by = c("Season", "Wteam"))
+    loppg <- woppg
+    names(loppg) <- c("Season", "Lteam", "Loppg")
+    seasonWithppg <- merge(seasonWithppg, loppg, by = c("Season", "Lteam"))
+    
+    # Tidy up the dataset
+    ret <- 
+        seasonWithppg[, .(Season, Daynum, Team = Lteam, Score = Lscore, PPG = Lppg, AllowedPPG = Loppg,
+                          Oteam = Wteam, OScore = Wscore, Oppg = Wppg, OAllowedPPG = Woppg)] %>%
+        arrange(Season, Daynum) %>% data.table()
+    ret
+}
 
+seasonWithPPGs <- getAveragePointsForGame(compactSeason)
+rm(compactSeason)
+head(seasonWithPPGs)
+```
 
+We create a table for each team/season combination to keep track of their performance throughout the season.
+We use their season average as the initial rating.
+```{r Offensive and Defensive Rating Table, eval=FALSE, include=FALSE}
+# Used to put higher seeds in the table
+altSeasonWithPPGs <- copy(seasonWithPPGs)
+invisible(altSeasonWithPPGs[, Team := Oteam][, Score := OScore][, PPG := Oppg][, AllowedPPG := OAllowedPPG])
+
+teamRatingTable <- unique(seasonWithPPGs %>% rbind(altSeasonWithPPGs), by = c("Season", "Team")) %>%
+    .[, .(Season, Team, ORtg = PPG, DRtg = AllowedPPG, nGames = 0, lastDay = 0)]
+rm(altSeasonWithPPGs)
+
+#teamRatingTable <- seasonStats[.(Season, Team, PPG = Wscore)]
+teamRatingTable
+```
+
+To update the ratings, the logic is as follows:
+
+$$
+OL_{t} = OL_{t-1} + \alpha\left(Score_t - \frac{OL_{t-1} + Opp.DL_{t-1}}{2}\right); OL_{t = 0} = PPG\\
+DL_{t} = DL_{t-1} + \alpha\left(Opp.Score_t - \frac{DL_{t-1} + Opp.OL_{t-1}}{2}\right); DL_{t = 0} = AllowedPPG\\
+$$
+
+Now we go through each game and update the table based on the results
+```{r Update Ratings, eval=FALSE, include=FALSE}
+alph <- 0.2
+head(teamRatingTable)
+for(i in 1:nrow(seasonWithPPGs)) {
+    s <- seasonWithPPGs[i, Season]
+    team1 <- seasonWithPPGs[i, Team]
+    team2 <- seasonWithPPGs[i, Oteam]
+    score <- seasonWithPPGs[i, Score]
+    oscore <- seasonWithPPGs[i, OScore]
+    # Update Offensive Rating for Team 1 and Defensive Rating for Team 2
+    ol1 <- teamRatingTable[Team == team1 & Season == s, ORtg]
+    dl2 <- teamRatingTable[Team == team2 & Season == s, DRtg]
+    rtgChange <- alph * (score - (ol1 + dl2) / 2)
+    teamRatingTable[Team == team1 & Season == s, ORtg := ol1 + rtgChange]
+    teamRatingTable[Team == team2 & Season == s, DRtg := dl2 + rtgChange]
+    
+    # Update Offensive Rating For Team 2 and Defensive Rating for Team 1
+    ol2 <- teamRatingTable[Team == team2 & Season == s, ORtg]
+    dl1 <- teamRatingTable[Team == team1 & Season == s, DRtg]
+    rtgChange <- alph * (oscore - (ol2 + dl1) / 2)
+    teamRatingTable[Team == team2 & Season == s, ORtg := ol2 + rtgChange]
+    teamRatingTable[Team == team1 & Season == s, DRtg := dl1 + rtgChange]
+}
+rm(i, team1, team2, score, oscore, ol1, dl2, ol2, dl1, rtgChange)
+head(teamRatingTable)
+```
+
+### Will continue later, need to develop and evaluate the model
+
+## Building the Model
+We could use only tournament data for training and testing (as calculated in previous chunk), 
+but instead, we add regular season match ups between two tournament teams for additional data.
+The sample submission data also contains these matchups.
+
+```{r Create training data}
+tournamentTeams <- paste(tournament$Season, tournament$Wteam, sep = "_") %>% 
+    c(paste(tournament$Season, tournament$Lteam, sep = "_")) %>% unique()
+
+labeledMatchups <- tournament %>% 
+    rbind(regularSeason %>% subset(Wteam %in% tournamentTeams & 
+                                   Lteam %in% tournamentTeams)) %>% 
+    convertToSub()
+training <- combineLabelsWithStats(labeledMatchups, seasonStats2)
+tail(training)
+```
+```{r Clean Workspace, include=FALSE}
+rm(labeledSeasonStats)
+rm(tournamentWithSeasonStats)
+rm(tournamentTeams)
+```
+
+Now with the training data, we hold out the 2013-2016 match ups for testing.
+```{r Data Splitting}
+testing <- training %>% subset(grepl("^201[3-6]", id))
+training <- training %>% subset(!grepl("^201[3-6]", id))
+```
+
+Here is a generic function for training multiple models based on the log loss metric
+```{r Build Models, message=FALSE, warning=FALSE, include=FALSE}
+buildModel <- function(training, method = "glm", ...) {
+    loglossSummary <- function(data, lev = NULL, model = NULL)  {  
+        #print(paste(class(data$pred))) # factor  j
+        data$pred <- as.numeric(data$pred)-1 # otherwise I get an error as these are factors  
+        data$obs <- as.numeric(data$obs)-1 # otherwise I get an error as these are factors  
+        epsilon      <- .000000000000001  
+        yhat           <- pmin(pmax(data$pred, rep(epsilon)), 1-rep(epsilon))  
+        logloss      <- -mean(data$obs*log(yhat) + (1-data$obs)*log(1 - yhat))  
+        names(logloss) <- "LOGLOSS"  
+        logloss  
+    }  
+    traindf <- as.data.frame(training)[, -1] # remove the ids
+    traindf$label <- as.factor(traindf$label)
+    tc <- trainControl(method = "cv", number = 5, summaryFunction = loglossSummary)
+    train(label ~ ., data = traindf, method = method, trControl = tc, metric = "LOGLOSS", maximize = F, ...)
+}
+
+m1 <- buildModel(training)
+m2 <- buildModel(training, "glmnet")
+m3 <- buildModel(training, "rf")
+m4 <- buildModel(training, "svmLinear2", probability = T)
+```
+Evaluating the models, we get:
+```{r Evaluate Models, echo=FALSE}
+evalModel <- function(model, testing, labeled = T) {
+    pred1 <- predict(model, testing, type = "prob")
+    if(!labeled) {
+        return(pred1[, '1'])
+    }
+    evaldf <- data.frame(label = testing$label, pred = pred1[, '1'])
+    evaldf$logloss <- -(evaldf$label * log(evaldf$pred) + (1 - evaldf$label) * log(1 - evaldf$pred))
+    print(paste(model$method, "Log Loss:", mean(evaldf$logloss)))
+    print(paste(model$method, "Accuracy:", 1 - mean(abs(evaldf$label - round(evaldf$pred)))))
+}
+evalModel(m1, testing)
+evalModel(m2, testing)
+evalModel(m3, testing)
+evalModel(m4, testing)
+```
+
+## Predicting the sample data
+```{r Submission}
+predictSample <- function(model) {
+    submission <- sampleSub %>% select(id) %>% combineLabelsWithStats(seasonStats2)
+    sub <- data.frame(id = submission$id, pred = evalModel(model, submission, labeled = F))
+    write.csv(sub,
+              file = paste0("submissions/", model$method, "_", Sys.Date(), ".csv"))
+}
+predictSample(m2)
+```
 
