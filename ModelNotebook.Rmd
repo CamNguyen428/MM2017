@@ -31,8 +31,8 @@ set.seed(2)
 ```
 
 ```{r Read Data}
-regularSeason <- fread("RegularSeasonDetailedResults.csv")
-tournament <- fread("TourneyDetailedResults.csv")
+regularSeason <- fread("RegularSeasonDetailedResults.csv") 
+tournament <- fread("TourneyDetailedResults.csv") 
 head(regularSeason)
 head(tournament)
 ```
@@ -74,7 +74,7 @@ To create features that can be added to our labeled data, we look at the followi
 The following function computes the season averages for each of the major basketball offensive statistical categories using any detailed data.
 
 ```{r Compute Season Averages}
-compressStats <- function(dt) {
+compressStats <- function(dt, pattern = "^W") {
     # Helper function to calculate for a single feature
     calcFeatWithString <- function(dt, featStr) {
         wFeat <- dt[, .(wfeat = mean(get(featStr)), nwins = .N), by = c("Season", "Wteam")]
@@ -91,7 +91,7 @@ compressStats <- function(dt) {
     }
     dt <- copy(dt)
     dt[, Wloc := NULL]
-    statNames <- grep("^[W]", names(dt), value = T)
+    statNames <- grep(pattern, names(dt), value = T)
     statNames <- statNames[statNames != "Wteam"]
     statNames <- statNames[statNames != "Lteam"]
     ret <- dt[, .(Season, Team = Wteam)] %>% unique()
@@ -193,7 +193,8 @@ head(tournamentWithSeasonStats)
 We create a table for each team/season combination to keep track of their performance throughout the season.
 We use their season average as the initial rating.
 ```{r Offensive and Defensive Rating Table}
-teamRatingTable <- seasonStats[, .(Season, Team, ORtg = Wscore, DRtg = Lscore, nGames = 0, lastDay = 0)]
+ss <- compressStats(regularSeason, "^[LW]")
+teamRatingTable <- ss[, .(Season, Team, ORtg = Wscore, DRtg = Lscore, nGames = 0, lastDay = 0)]
 teamRatingTable
 ```
 
@@ -210,7 +211,7 @@ alph <- 0.2
 head(teamRatingTable)
 teamRatingMatrix <- teamRatingTable %>% as.matrix()
 for(i in 1:nrow(regularSeason)) {
-    break
+    if(i %% 10000 == 1) {print(i)}
     s <- regularSeason[i, Season]
     d <- regularSeason[i, Daynum]
     team1 <- regularSeason[i, Wteam]
@@ -240,6 +241,7 @@ for(i in 1:nrow(regularSeason)) {
 rm(i, team1, team2, score, oscore, ol1, dl2, ol2, dl1, rtgChange)
 teamRatingTable <- data.table(teamRatingMatrix)
 head(teamRatingTable)
+seasonStats2 <- merge(seasonStats2, teamRatingTable[, .(Season, Team, DRtg, ORtg)], by = c("Season", "Team"))
 ```
 
 ### Will continue later, need to develop and evaluate the model
@@ -272,7 +274,8 @@ testing <- training %>% subset(grepl("^201[3-6]", id))
 training <- training %>% subset(!grepl("^201[3-6]", id))
 ```
 
-Here is a generic function for training multiple models based on the log loss metric
+Here is a generic function for training multiple models based on the log loss metric. We minimize log loss to penalize
+large upsets more.
 ```{r Build Models, message=FALSE, warning=FALSE, include=FALSE}
 buildModel <- function(training, method = "glm", ...) {
     loglossSummary <- function(data, lev = NULL, model = NULL)  {  
@@ -312,6 +315,8 @@ evalModel(m1, testing)
 evalModel(m2, testing)
 evalModel(m3, testing)
 evalModel(m4, testing)
+print(predictors(m1$terms))
+print(paste("alpha =",alph))
 ```
 
 ## Predicting the sample data
@@ -320,7 +325,8 @@ predictSubmission <- function(model) {
     submission <- sampleSub %>% select(id) %>% combineLabelsWithStats(seasonStats2)
     sub <- data.frame(id = submission$id, pred = evalModel(model, submission, labeled = F))
     write.csv(sub,
-              file = paste0("submissions/", model$method, "_", Sys.Date(), ".csv"))
+              file = paste0("submissions/", model$method, "_", Sys.Date(), ".csv"), row.names = F)
 }
-predictSubmission(m2)
+predictSubmission(m4)
+predictors(m2$terms)
 ```
