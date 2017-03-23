@@ -31,26 +31,28 @@ set.seed(2)
 ```
 
 ```{r Read Data}
-regularSeason <- fread("RegularSeasonDetailedResults.csv") 
-tournament <- fread("TourneyDetailedResults.csv") 
+regularSeason <- fread("newdata/RegularSeasonDetailedResults.csv") 
+tournament <- fread("newdata/TourneyDetailedResults.csv") 
 head(regularSeason)
 head(tournament)
 ```
 ## Tidying the data
 To generate training and testing data, we need to work with data tables with the same formatting as the sample submission, which is formatted as follows:
 ```{r Show Sub}
-sampleSub <- fread("sample_submission.csv")
+#sampleSub <- fread("sample_submission.csv")
+sampleSub <- fread("newdata/SampleSubmission.csv")
+
 head(sampleSub)
 ```
-We need to get ids for all the games that contain the season, followed by the team with the lower team id, then the team with the higher team id. 
-The label is 1 when the team with the lower team id wins, and 0 otherwise. To create this data table, we use the following function:
+We need to get Ids for all the games that contain the season, followed by the team with the lower team Id, then the team with the higher team Id. 
+The label is 1 when the team with the lower team Id wins, and 0 otherwise. To create this data table, we use the following function:
 ```{r Format to Submission}
 # Converts detailed data to submission data
 convertToSub <- function(dt) {
     dt <- copy(dt)
-    dt[, id := paste(Season, ifelse(Wteam > Lteam, Lteam, Wteam), ifelse(Wteam < Lteam, Lteam, Wteam), sep = "_")]
+    dt[, Id := paste(Season, ifelse(Wteam > Lteam, Lteam, Wteam), ifelse(Wteam < Lteam, Lteam, Wteam), sep = "_")]
     dt[, label := as.numeric(Wteam < Lteam)]
-    dt[, .(id, label)]
+    dt[, .(Id, label)]
 }
 
 labeledSeason <- convertToSub(regularSeason)
@@ -123,7 +125,7 @@ addFeatures <- function(df) {
                       )
     }
     addSeeds <- function(df) {
-        seeds <- fread("TourneySeeds.csv")
+        seeds <- fread("newdata/TourneySeeds.csv")
         seeds[, SeedNum := gsub('[a-zA-Z]', '', Seed) %>% as.numeric]
         combined <- merge(df, seeds[, .(Season, Team, SeedNum)], 
                           all.x = T, by = c("Season", "Team"))
@@ -154,7 +156,8 @@ addFeatures <- function(df) {
                             #, Lefgp = (Lfgm + Lfgm3 * .5) / Lfga
                             )
     }
-    df <- df %>% createFreeThrowPercentage() %>% addSeeds() %>% 
+    df <- df %>% createFreeThrowPercentage() %>% 
+        #addSeeds() %>% 
         addPossessions() %>% 
         computeAssistPercentage %>%
         removeFreeThrows() %>% addInteractions() %>% computeEffectiveFieldGoalPercentage()
@@ -168,14 +171,14 @@ Now that we have the labeled data and the stats for each team, we can combine th
 ```{r Combine Label with Stats}
 combineLabelsWithStats <- function(labeled, stats) {
     stats <- copy(stats)
-    stats[, id := paste(Season, Team, sep = "_")]
+    stats[, Id := paste(Season, Team, sep = "_")]
     #stats$Season <- stats$Team <- NULL
     stats[, Season := NULL][, Team := NULL]
     labeled <- copy(labeled)
-    labeled[, team1 := gsub("_[0-9]+$", "", id)]
-    labeled[, team2 := gsub("_[0-9]+_", "_", id)]
-    ret <- merge(labeled, stats, all.x = T, by.x = "team1", by.y ="id")
-    ret <- merge(ret, stats, all.x = T, by.x = "team2", by.y ="id", suffixes = c(".1", ".2"))
+    labeled[, team1 := gsub("_[0-9]+$", "", Id)]
+    labeled[, team2 := gsub("_[0-9]+_", "_", Id)]
+    ret <- merge(labeled, stats, all.x = T, by.x = "team1", by.y ="Id")
+    ret <- merge(ret, stats, all.x = T, by.x = "team2", by.y ="Id", suffixes = c(".1", ".2"))
     ret[, team2 := NULL][, team1 := NULL]
     ret
 }
@@ -270,8 +273,8 @@ rm(tournamentTeams)
 
 Now with the training data, we hold out the 2013-2016 match ups for testing.
 ```{r Data Splitting}
-testing <- training %>% subset(grepl("^201[3-6]", id))
-training <- training %>% subset(!grepl("^201[3-6]", id))
+testing <- training %>% subset(grepl("^201[6-7]", Id))
+training <- training %>% subset(!grepl("^201[6-7]", Id))
 ```
 
 Here is a generic function for training multiple models based on the log loss metric. We minimize log loss to penalize
@@ -288,7 +291,7 @@ buildModel <- function(training, method = "glm", ...) {
         names(logloss) <- "LOGLOSS"  
         logloss  
     }  
-    traindf <- as.data.frame(training)[, -1] # remove the ids
+    traindf <- as.data.frame(training)[, -1] # remove the Ids
     traindf$label <- as.factor(traindf$label)
     tc <- trainControl(method = "cv", number = 5, summaryFunction = loglossSummary)
     train(label ~ ., data = traindf, method = method, trControl = tc, metric = "LOGLOSS", maximize = F, ...)
@@ -316,17 +319,26 @@ evalModel(m2, testing)
 evalModel(m3, testing)
 evalModel(m4, testing)
 print(predictors(m1$terms))
-print(paste("alpha =",alph))
+print(paste("alpha =", alph))
 ```
 
 ## Predicting the sample data
 ```{r Submission}
 predictSubmission <- function(model) {
-    submission <- sampleSub %>% select(id) %>% combineLabelsWithStats(seasonStats2)
-    sub <- data.frame(id = submission$id, pred = evalModel(model, submission, labeled = F))
+    submission <- sampleSub %>% select(Id) %>% combineLabelsWithStats(seasonStats2)
+    sub <- data.frame(Id = submission$Id, Pred = evalModel(model, submission, labeled = F))
     write.csv(sub,
               file = paste0("submissions/", model$method, "_", Sys.Date(), ".csv"), row.names = F)
+    write.csv(sub,
+              file = paste0("submissions/lastModel.csv"), row.names = F)
 }
 predictSubmission(m4)
-predictors(m2$terms)
 ```
+
+## Creating a Bracket
+```{bash}
+./predicted_bracket_generator/makebracket submissions/lastModel.csv
+```
+
+
+
